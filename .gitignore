@@ -1,0 +1,13 @@
+*.aux
+*.tfw
+*.tif
+*.tif.ovr
+*.htm
+*.cpg
+*.dbf
+*.prj
+*.README.html
+*.shp
+*.shx
+*.VERSION.txt
+.venv
