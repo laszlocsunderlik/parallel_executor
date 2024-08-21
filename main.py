@@ -1,9 +1,9 @@
 import asyncio
 import concurrent.futures
-import functools
 import os
 import time
-from typing import Optional, Union, Dict
+from typing import Optional, Union, Dict, Iterable
+import functools
 
 import numpy as np
 import pandas as pd
@@ -38,87 +38,99 @@ def get_states(boundaries: Union[gpd.GeoDataFrame, str], desired_epsg_crs: Optio
 
 def get_crs_from_raster(src: rasterio.DatasetReader) -> str:
     return str(src.crs).split(":")[1]
-    
 
-def process_chunk(masked_raster: np.ndarray, crop_value: int, window: Window) -> float:
-    data = masked_raster[window.row_off:window.row_off + window.height, window.col_off:window.col_off + window.width]
-    crop_mask = data == crop_value
-    pixel_area_ha = 30 * 30 / 10000
-    crop_coverage_ha = np.sum(crop_mask) * pixel_area_ha
-    return crop_coverage_ha
-
-def calculate_crop_coverage(masked_raster: np.ndarray, crop_values: Dict[str, int], chunk_size: int) -> Dict[str, float]:
+def partition_raster(masked_raster: np.ndarray, chunk_size: int) -> Iterable:
     height, width = masked_raster.shape
-    total_coverage = {crop: 0.0 for crop in crop_values.keys()}
-    
     for i in range(0, width, chunk_size):
         for j in range(0, height, chunk_size):
             window = Window(i, j, min(chunk_size, width - i), min(chunk_size, height - j))
-            
-            for crop_name, crop_value in crop_values.items():
-                total_coverage[crop_name] += process_chunk(masked_raster, crop_value, window)
-    
+            yield masked_raster[window.row_off:window.row_off + window.height, window.col_off:window.col_off + window.width]
+
+def process_partition(window_raster: np.ndarray, crop_values: list[int]) -> Dict[int, float]:
+    total_coverage = {crop_value: 0.0 for crop_value in crop_values}
+    pixel_area_ha = 30 * 30 / 10000
+
+    for crop_value in crop_values:
+        crop_mask = window_raster == crop_value
+        total_coverage[crop_value] += np.sum(crop_mask) * pixel_area_ha
+
     return total_coverage
 
-async def async_process_crop_type(masked_raster: np.ndarray, crop_values: Dict[str, int], chunk_size: int) -> Dict[str, float]:
-    loop = asyncio.get_running_loop()
-    partial_func = functools.partial(calculate_crop_coverage, masked_raster, crop_values, chunk_size)
-    
-    with concurrent.futures.ThreadPoolExecutor() as pool:
-        total_coverage = await loop.run_in_executor(pool, partial_func)
-    
-    return total_coverage
+def merge_coverages(coverage1: Dict[int, float], coverage2: Dict[int, float]) -> dict[int, float]:
+    merged_coverage = coverage1.copy()  
+    for crop_value, coverage in coverage2.items():
+        if crop_value in merged_coverage:
+            merged_coverage[crop_value] += coverage
+        else:
+            merged_coverage[crop_value] = coverage
+    return merged_coverage
 
-async def process_raster(
-        raster: rasterio.DatasetReader, 
-        state_df: gpd.GeoDataFrame, 
+def process_single_state(
+        state: gpd.GeoSeries,
+        raster_file: str,
         year: str,
-        chunk_size: Optional[int] = 1000) -> pd.DataFrame:
-    results = []
-    
-    for _, state in state_df.iterrows():
-        state_name = state['name']
-        geometry = [mapping(state['geometry'])]
-        print(Fore.RED + f'Processing state: {state_name} for {year}', flush=True)
-        out_image, _ = mask(raster, geometry, crop=True)
+        chunk_size: int) -> dict[str, float]:
+
+    state_name = state['name']
+    geometry = [mapping(state['geometry'])]
+    print(Fore.RED + f'Processing state: {state_name} for {year}', flush=True)
+
+    with rasterio.open(raster_file) as src:
+        out_image, _ = mask(src, geometry, crop=True)
         masked_raster = out_image[0]
 
-        tasks = [
-            async_process_crop_type(masked_raster, {crop_name: crop_value}, chunk_size)
-            for crop_name, crop_value in CROP_TYPES.items()
-        ]
+        crop_values = list(CROP_TYPES.values())
+        with concurrent.futures.ProcessPoolExecutor(max_workers=8) as executor:
+            partitions = list(partition_raster(masked_raster, chunk_size))
+            results = executor.map(functools.partial(process_partition, crop_values=crop_values), partitions)
 
-        coverages = await asyncio.gather(*tasks)
+            total_coverage = functools.reduce(merge_coverages, results)
 
-        result = {
-            'state': state_name,
-            'year': year,
-        }
-        for coverage, (crop_name, _) in zip(coverages, CROP_TYPES.items()):
-            result[f'{crop_name.lower()}_coverage_ha'] = coverage[crop_name]
+        coverages = {f'{crop_name.lower()}_coverage_ha': total_coverage[crop_value]
+                     for crop_name, crop_value in CROP_TYPES.items()}
 
-        results.append(result)
+    result = {
+        'state': state_name,
+        'year': year,
+    }
+    result.update(coverages)
 
+    return result
+
+async def async_process_states(
+        raster_file: str, 
+        state_df: gpd.GeoDataFrame, 
+        year: str,
+        chunk_size: int) -> pd.DataFrame:
+    
+    loop = asyncio.get_running_loop()
+    tasks = []
+
+    with concurrent.futures.ProcessPoolExecutor(max_workers=4) as pool:
+        for _, state in state_df.iterrows():
+            tasks.append(loop.run_in_executor(
+                pool, process_single_state, state, raster_file, year, chunk_size
+            ))
+
+        results = await asyncio.gather(*tasks)
+    
     results_df = pd.DataFrame(results)
     return results_df
 
-async def main(chunk_size):
+async def main(chunk_size: int):
     wd = os.getcwd()
     state_boundaries = gpd.read_file(f"{wd}/data/ne_50m_admin_1_states_provinces/ne_50m_admin_1_states_provinces.shp")
     raster_file = f"{wd}/data/2020_30m_cdls/2020_30m_cdls.tif"
     year = os.path.basename(raster_file).split('_')[0]
 
-    all_results = []
     with rasterio.open(raster_file) as src:
         print(f"Processing raster: {src}")
 
         crs = get_crs_from_raster(src)
         transformed_states = get_states(boundaries=state_boundaries, desired_epsg_crs=crs)
-        results_df = await process_raster(src, transformed_states, year, chunk_size)
-        all_results.append(results_df)
+        results_df = await async_process_states(raster_file, transformed_states, year, chunk_size)
 
-    final_results_df = pd.concat(all_results, ignore_index=True)
-    final_results_df.to_csv("output/simple_out.csv")
+    results_df.to_csv("output/simple_out3.csv")
 
 if __name__ == '__main__':
     start_time = time.time()
@@ -127,10 +139,23 @@ if __name__ == '__main__':
     print("---------------------------------------  SCRIPT STARTED  ----------------------------------------")
     print("-------------------------------------------------------------------------------------------------")
 
-    asyncio.run(main(chunk_size=5000))
+    asyncio.run(main(chunk_size=500))
 
     run_time = time.time() - start_time
     print("--------------------------------------  SCRIPT FINISHED  ----------------------------------------")
     print(f"--------------------------- Script finished in {run_time:.1f} seconds --------------------------")
     print("-------------------------------------------------------------------------------------------------")
     print("\n")
+    '''
+    Key Points:
+        Nested Parallelism:
+
+        The outer ProcessPoolExecutor handles state-level parallelism.
+        The inner ProcessPoolExecutor handles partition-level parallelism within each state.
+        merge_coverages:
+
+        Merges the dictionaries from each partition into a single dictionary per state.
+        process_partition:
+
+        Processes a single partition to calculate the crop coverage for all crop types.
+    '''
