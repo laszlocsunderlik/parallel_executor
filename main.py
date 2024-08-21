@@ -2,8 +2,7 @@ import asyncio
 import concurrent.futures
 import os
 import time
-from typing import Optional, Union, Dict, Iterable
-import functools
+from typing import Optional, Union, Dict
 
 import numpy as np
 import pandas as pd
@@ -39,38 +38,29 @@ def get_states(boundaries: Union[gpd.GeoDataFrame, str], desired_epsg_crs: Optio
 def get_crs_from_raster(src: rasterio.DatasetReader) -> str:
     return str(src.crs).split(":")[1]
 
-def partition_raster(masked_raster: np.ndarray, chunk_size: int) -> Iterable:
+def process_chunk(masked_raster: np.ndarray, crop_value: int, window: Window) -> float:
+    data = masked_raster[window.row_off:window.row_off + window.height, window.col_off:window.col_off + window.width]
+    crop_mask = data == crop_value
+    pixel_area_ha = 30 * 30 / 10000
+    crop_coverage_ha = np.sum(crop_mask) * pixel_area_ha
+    return crop_coverage_ha
+
+def calculate_crop_coverage(masked_raster: np.ndarray, crop_value: int, chunk_size: int) -> float:
     height, width = masked_raster.shape
+    total_coverage = 0.0
     for i in range(0, width, chunk_size):
         for j in range(0, height, chunk_size):
             window = Window(i, j, min(chunk_size, width - i), min(chunk_size, height - j))
-            yield masked_raster[window.row_off:window.row_off + window.height, window.col_off:window.col_off + window.width]
-
-def process_partition(window_raster: np.ndarray, crop_values: list[int]) -> Dict[int, float]:
-    total_coverage = {crop_value: 0.0 for crop_value in crop_values}
-    pixel_area_ha = 30 * 30 / 10000
-
-    for crop_value in crop_values:
-        crop_mask = window_raster == crop_value
-        total_coverage[crop_value] += np.sum(crop_mask) * pixel_area_ha
-
+            total_coverage += process_chunk(masked_raster, crop_value, window)
+    
     return total_coverage
-
-def merge_coverages(coverage1: Dict[int, float], coverage2: Dict[int, float]) -> dict[int, float]:
-    merged_coverage = coverage1.copy()  
-    for crop_value, coverage in coverage2.items():
-        if crop_value in merged_coverage:
-            merged_coverage[crop_value] += coverage
-        else:
-            merged_coverage[crop_value] = coverage
-    return merged_coverage
 
 def process_single_state(
         state: gpd.GeoSeries,
         raster_file: str,
         year: str,
-        chunk_size: int) -> dict[str, float]:
-
+        chunk_size: int) -> Dict[str, float]:
+    
     state_name = state['name']
     geometry = [mapping(state['geometry'])]
     print(Fore.RED + f'Processing state: {state_name} for {year}', flush=True)
@@ -79,15 +69,9 @@ def process_single_state(
         out_image, _ = mask(src, geometry, crop=True)
         masked_raster = out_image[0]
 
-        crop_values = list(CROP_TYPES.values())
-        with concurrent.futures.ProcessPoolExecutor(max_workers=8) as executor:
-            partitions = list(partition_raster(masked_raster, chunk_size))
-            results = executor.map(functools.partial(process_partition, crop_values=crop_values), partitions)
-
-            total_coverage = functools.reduce(merge_coverages, results)
-
-        coverages = {f'{crop_name.lower()}_coverage_ha': total_coverage[crop_value]
-                     for crop_name, crop_value in CROP_TYPES.items()}
+        coverages = {}
+        for crop_name, crop_value in CROP_TYPES.items():
+            coverages[f'{crop_name.lower()}_coverage_ha'] = calculate_crop_coverage(masked_raster, crop_value, chunk_size)
 
     result = {
         'state': state_name,
@@ -139,23 +123,10 @@ if __name__ == '__main__':
     print("---------------------------------------  SCRIPT STARTED  ----------------------------------------")
     print("-------------------------------------------------------------------------------------------------")
 
-    asyncio.run(main(chunk_size=500))
+    asyncio.run(main(chunk_size=1000))
 
     run_time = time.time() - start_time
     print("--------------------------------------  SCRIPT FINISHED  ----------------------------------------")
     print(f"--------------------------- Script finished in {run_time:.1f} seconds --------------------------")
     print("-------------------------------------------------------------------------------------------------")
     print("\n")
-    '''
-    Key Points:
-        Nested Parallelism:
-
-        The outer ProcessPoolExecutor handles state-level parallelism.
-        The inner ProcessPoolExecutor handles partition-level parallelism within each state.
-        merge_coverages:
-
-        Merges the dictionaries from each partition into a single dictionary per state.
-        process_partition:
-
-        Processes a single partition to calculate the crop coverage for all crop types.
-    '''
