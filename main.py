@@ -52,7 +52,7 @@ def calculate_crop_coverage(masked_raster: np.ndarray, crop_value: int, chunk_si
         for j in range(0, height, chunk_size):
             window = Window(i, j, min(chunk_size, width - i), min(chunk_size, height - j))
             total_coverage += process_chunk(masked_raster, crop_value, window)
-    
+
     return total_coverage
 
 def process_single_state(
@@ -79,6 +79,8 @@ def process_single_state(
     }
     result.update(coverages)
 
+    print(Fore.GREEN + f"Result for {state_name}: {result}")
+
     return result
 
 async def async_process_states(
@@ -86,7 +88,6 @@ async def async_process_states(
         state_df: gpd.GeoDataFrame, 
         year: str,
         chunk_size: int) -> pd.DataFrame:
-    
     loop = asyncio.get_running_loop()
     tasks = []
 
@@ -97,7 +98,6 @@ async def async_process_states(
             ))
 
         results = await asyncio.gather(*tasks)
-    
     results_df = pd.DataFrame(results)
     return results_df
 
@@ -123,7 +123,7 @@ if __name__ == '__main__':
     print("---------------------------------------  SCRIPT STARTED  ----------------------------------------")
     print("-------------------------------------------------------------------------------------------------")
 
-    asyncio.run(main(chunk_size=1000))
+    asyncio.run(main(chunk_size=2000))
 
     run_time = time.time() - start_time
     print("--------------------------------------  SCRIPT FINISHED  ----------------------------------------")
